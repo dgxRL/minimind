@@ -357,7 +357,7 @@ torchrun --nproc_per_node N train_xxx.py
 ```bash
 ... train_xxx.py --use_wandb
 ```
-After June `2025`, domestic network environments in China typically cannot directly connect to WandB. MiniMind currently defaults to using [SwanLab](https://swanlab.cn/) as the training visualization tool, whose interface is basically compatible with WandB; usually you only need to replace `import wandb` with `import swanlab as wandb`, and other usage remains largely unchanged.
+After June `2025`, domestic network environments in China typically cannot directly connect to WandB. MiniMind currently defaults to using [SwanLab](https://swanlab.cn/) as the training visualization tool, whose interface is basically compatible with WandB; usually you only need to replace `import wandb` with `import wandb`, and other usage remains largely unchanged.
 
 </details>
 
