@@ -134,6 +134,7 @@ def rollout_single(rollout_engine, tokenizer, messages, tools, max_turns=3, max_
             break
         unfinished = turn == max_turns - 1
         messages.append({"role": "assistant", "content": new_text})
+        
         for call in calls:
             name, raw = call.get("name", ""), call.get("arguments", {})
             if isinstance(raw, str):
