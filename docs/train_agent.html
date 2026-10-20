@@ -1,0 +1,392 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>train_agent.py — Agent RL Training Pipeline</title>
+<style>
+  :root{
+    --fg:#1a1d23; --muted:#5b6472; --border:#d8dce3; --surface:#f6f8fa;
+    --accent:#2563eb; --accent-soft:#dbeafe; --success:#059669; --success-soft:#d1fae5;
+    --warning:#b45309; --warning-soft:#fef3c7; --error:#dc2626; --error-soft:#fee2e2;
+    --purple:#7c3aed; --purple-soft:#ede9fe;
+    --code-bg:#0f172a; --code-fg:#e2e8f0;
+  }
+  *{box-sizing:border-box}
+  body{font-family:-apple-system,"Segoe UI",Roboto,"Helvetica Neue",Arial,sans-serif;color:var(--fg);margin:0;line-height:1.6;background:#fff}
+  .wrap{max-width:980px;margin:0 auto;padding:32px 24px 80px}
+  h1{font-size:2rem;border-bottom:3px solid var(--accent);padding-bottom:.4rem;margin-bottom:.2rem}
+  h2{font-size:1.35rem;margin-top:2.6rem;border-left:5px solid var(--accent);padding-left:.6rem}
+  h3{font-size:1.05rem;margin-top:1.6rem;color:var(--accent)}
+  .subtitle{color:var(--muted);margin-top:.2rem}
+  table{border-collapse:collapse;width:100%;margin:1rem 0;font-size:.88rem}
+  th,td{border:1px solid var(--border);padding:6px 10px;text-align:left;vertical-align:top}
+  th{background:var(--surface)}
+  code{background:var(--surface);border:1px solid var(--border);border-radius:3px;padding:1px 5px;font-size:.85em;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+  pre{background:var(--code-bg);color:var(--code-fg);padding:14px 16px;border-radius:8px;overflow-x:auto;font-size:.85rem;line-height:1.5}
+  pre code{background:none;border:none;color:inherit;padding:0}
+  .figure{margin:1.4rem 0;border:1px solid var(--border);border-radius:10px;padding:14px;background:var(--surface)}
+  .figure figcaption{font-size:.85rem;color:var(--muted);margin-top:8px;text-align:center}
+  .note{border-left:4px solid var(--warning);background:var(--warning-soft);padding:10px 14px;border-radius:0 8px 8px 0;margin:1rem 0;font-size:.9rem}
+  .pos{color:var(--success);font-weight:600}
+  .neg{color:var(--error);font-weight:600}
+  svg text{font-family:inherit}
+  .small{font-size:.85rem;color:var(--muted)}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<h1><code>trainer/train_agent.py</code> — Agent RL Pipeline</h1>
+<p class="subtitle">Multi-turn tool-calling agent fine-tuning with GRPO / CISPO. Source of truth: <code>trainer/train_agent.py</code> (492 lines, branch <code>dev</code>).</p>
+
+<!-- ================================================================ 1. BIG PICTURE -->
+<h2>1. Big picture</h2>
+<p>The script trains a MiniMind policy to <em>use tools correctly</em>. Each batch: sample <code>num_generations</code> multi-turn agent trajectories per prompt against <strong>mock tools</strong>, score them with a <strong>rule-based reward</strong> (+ optional InternLM2 reward model), compute a <strong>group-relative advantage</strong> (GRPO-style), and update the policy with a <strong>CISPO</strong> (default) or clipped-GRPO loss plus a k3-estimated KL penalty against a frozen reference model.</p>
+
+<table>
+  <tr><th>Component</th><th>Role</th><th>Key default</th></tr>
+  <tr><td><code>model</code></td><td>Policy: <code>MiniMindForCausalLM</code> loaded from <code>--from_weight</code> (<code>full_sft</code>)</td><td>hidden 768, 8 layers</td></tr>
+  <tr><td><code>ref_model</code></td><td>Frozen reference for KL (<code>.eval().requires_grad_(False)</code>)</td><td>same init as policy</td></tr>
+  <tr><td><code>reward_model</code></td><td><code>LMForRewardModel</code> (InternLM2-1.8B-Reward), scores final answers when no tool call</td><td><code>../../internlm2-1_8b-reward</code>, fp16</td></tr>
+  <tr><td><code>rollout_engine</code></td><td>Generation + per-token logps; <code>torch</code> in-process or <code>sglang</code> server; <code>update_policy(model)</code> re-syncs weights every save interval</td><td><code>torch</code></td></tr>
+  <tr><td><code>AgentRLDataset</code></td><td>JSONL of <code>{messages, tools, gt}</code> — prompt chat, advertised tools, ground-truth call count / answers</td><td><code>../dataset/agent_rl.jsonl</code></td></tr>
+  <tr><td>Optimizer</td><td>AdamW + CosineAnnealingLR (η<sub>min</sub> = lr/10), grad accumulation, clip 1.0</td><td>lr 3e-7, accum 1</td></tr>
+  <tr><td>Distributed</td><td>DDP + <code>DistributedSampler</code>; resume via <code>lm_checkpoint</code> + <code>SkipBatchSampler</code></td><td>seed 42+rank</td></tr>
+</table>
+
+<figure class="figure">
+<svg viewBox="0 0 920 430" width="100%" xmlns="http://www.w3.org/2000/svg">
+  <defs><marker id="a1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#1a1d23"/></marker></defs>
+  <style>
+    .b1{fill:#fff;stroke:#d8dce3;stroke-width:1.5}
+    .m1{fill:#f6f8fa;stroke:#9aa3af;stroke-width:1.5}
+    .t1{font-size:13px;fill:#1a1d23}
+    .s1{font-size:11px;fill:#5b6472}
+    .f1{stroke:#1a1d23;stroke-width:1.4;fill:none;marker-end:url(#a1)}
+    .h1{font-size:14px;font-weight:bold}
+  </style>
+  <text x="460" y="26" text-anchor="middle" class="h1">Startup (<code>__main__</code>)</text>
+
+  <rect x="30" y="50" width="200" height="56" rx="8" class="b1"/>
+  <text x="130" y="72" text-anchor="middle" class="t1">init_distributed_mode</text>
+  <text x="130" y="90" text-anchor="middle" class="s1">seed 42 + rank · device cuda:N</text>
+
+  <rect x="270" y="50" width="180" height="56" rx="8" class="b1"/>
+  <text x="360" y="72" text-anchor="middle" class="t1">MiniMindConfig</text>
+  <text x="360" y="90" text-anchor="middle" class="s1">max_seq = 1024 + 768</text>
+
+  <rect x="490" y="50" width="200" height="56" rx="8" class="b1"/>
+  <text x="590" y="72" text-anchor="middle" class="t1">lm_checkpoint (resume)</text>
+  <text x="590" y="90" text-anchor="middle" class="s1">--from_resume=1 → epoch/step/opt</text>
+
+  <rect x="730" y="50" width="160" height="56" rx="8" class="b1"/>
+  <text x="810" y="72" text-anchor="middle" class="t1">wandb.init</text>
+  <text x="810" y="90" text-anchor="middle" class="s1">main rank only, resume id</text>
+
+  <rect x="60" y="150" width="240" height="70" rx="8" fill="#dbeafe" stroke="#2563eb" stroke-width="1.5"/>
+  <text x="180" y="175" text-anchor="middle" class="t1" fill="#2563eb" font-weight="bold">policy model</text>
+  <text x="180" y="194" text-anchor="middle" class="s1">init_model(from_weight='full_sft') + DDP</text>
+  <text x="180" y="210" text-anchor="middle" class="s1">optional torch.compile</text>
+
+  <rect x="340" y="150" width="240" height="70" rx="8" fill="#ede9fe" stroke="#7c3aed" stroke-width="1.5"/>
+  <text x="460" y="175" text-anchor="middle" class="t1" fill="#7c3aed" font-weight="bold">ref model (frozen)</text>
+  <text x="460" y="194" text-anchor="middle" class="s1">eval · requires_grad_(False)</text>
+  <text x="460" y="210" text-anchor="middle" class="s1">KL anchor</text>
+
+  <rect x="620" y="150" width="270" height="70" rx="8" fill="#fef3c7" stroke="#b45309" stroke-width="1.5"/>
+  <text x="755" y="175" text-anchor="middle" class="t1" fill="#b45309" font-weight="bold">reward model</text>
+  <text x="755" y="194" text-anchor="middle" class="s1">LMForRewardModel (InternLM2-1.8B-Reward)</text>
+  <text x="755" y="210" text-anchor="middle" class="s1">scores no-tool answers</text>
+
+  <rect x="60" y="260" width="240" height="70" rx="8" fill="#d1fae5" stroke="#059669" stroke-width="1.5"/>
+  <text x="180" y="285" text-anchor="middle" class="t1" fill="#059669" font-weight="bold">rollout engine</text>
+  <text x="180" y="304" text-anchor="middle" class="s1">torch in-process | sglang server</text>
+  <text x="180" y="320" text-anchor="middle" class="s1">create_rollout_engine → update_policy</text>
+
+  <rect x="340" y="260" width="240" height="70" rx="8" class="b1"/>
+  <text x="460" y="285" text-anchor="middle" class="t1">AgentRLDataset</text>
+  <text x="460" y="304" text-anchor="middle" class="s1">{messages, tools, gt} per sample</text>
+  <text x="460" y="320" text-anchor="middle" class="s1">collate keeps raw python objects</text>
+
+  <rect x="620" y="260" width="270" height="70" rx="8" class="b1"/>
+  <text x="755" y="285" text-anchor="middle" class="t1">AdamW + CosineAnnealingLR</text>
+  <text x="755" y="304" text-anchor="middle" class="s1">T_max = ceil(iters/accum)·epochs</text>
+  <text x="755" y="320" text-anchor="middle" class="s1">eta_min = lr / 10</text>
+
+  <rect x="200" y="370" width="520" height="40" rx="8" class="m1"/>
+  <text x="460" y="395" text-anchor="middle" class="t1" font-weight="bold">for epoch in [start_epoch, epochs): SkipBatchSampler → rl_train_epoch</text>
+
+  <path d="M 130 106 L 130 128 L 180 128 L 180 150" class="f1"/>
+  <path d="M 360 106 L 360 128 L 400 128 L 400 150" class="f1" opacity="0.3"/>
+  <path d="M 180 220 L 180 260" class="f1"/>
+  <path d="M 400 220 L 400 260" class="f1" opacity="0.3"/>
+  <path d="M 700 106 L 700 128 L 810 128 L 810 150" class="f1" opacity="0.3"/>
+  <path d="M 755 220 L 755 260" class="f1" opacity="0.3"/>
+  <path d="M 180 330 L 180 352 L 460 352 L 460 370" class="f1"/>
+  <path d="M 460 330 L 460 370" class="f1"/>
+  <path d="M 755 330 L 755 352 L 460 352" class="f1"/>
+</svg>
+<figcaption>Figure 1 — Startup wiring. All three models (policy, frozen reference, reward) coexist on the same device; the rollout engine wraps the policy and is re-synced after every checkpoint.</figcaption>
+</figure>
+
+<!-- ================================================================ 2. ROLLOUT -->
+<h2>2. Multi-turn rollout — <code>rollout_single</code></h2>
+<p>One trajectory = up to <code>max_turns = 3</code> generate→parse→execute cycles. Thinking mode is randomly enabled per trajectory with probability <code>thinking_ratio</code> (default 0.1). Everything the <strong>model</strong> generates is logged with mask 1 and real per-token logps; everything the <strong>environment</strong> injects (tool results + re-prompting) gets mask 0 and logp 0 — so the policy gradient only trains on the model's own tokens.</p>
+
+<figure class="figure">
+<svg viewBox="0 0 920 560" width="100%" xmlns="http://www.w3.org/2000/svg">
+  <defs><marker id="a2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#1a1d23"/></marker></defs>
+  <style>
+    .t2{font-size:13px;fill:#1a1d23}.s2{font-size:11px;fill:#5b6472}
+    .b2{fill:#fff;stroke:#d8dce3;stroke-width:1.5}
+    .d2{fill:#d1fae5;stroke:#059669;stroke-width:1.5}
+    .e2{fill:#fee2e2;stroke:#dc2626;stroke-width:1.5}
+    .f2{stroke:#1a1d23;stroke-width:1.4;fill:none;marker-end:url(#a2)}
+  </style>
+  <text x="460" y="24" text-anchor="middle" font-size="14" font-weight="bold">rollout_single — agent loop (≤ max_turns = 3)</text>
+
+  <rect x="310" y="40" width="300" height="44" rx="8" class="b2"/>
+  <text x="460" y="59" text-anchor="middle" class="t2">open_thinking = rand() &lt; thinking_ratio</text>
+  <text x="460" y="76" text-anchor="middle" class="s2">rollout engine decodes temp 0.8, ≤ max_new_tokens</text>
+
+  <line x1="460" y1="84" x2="460" y2="106" class="f2"/>
+  <rect x="250" y="106" width="420" height="70" rx="8" class="b2"/>
+  <text x="460" y="128" text-anchor="middle" class="t2">context = chat_template(messages, tools, add_generation_prompt)</text>
+  <text x="460" y="146" text-anchor="middle" class="s2">first turn only: prompt_ids = context_ids (baseline for packing)</text>
+  <text x="460" y="163" text-anchor="middle" class="s2">engine.rollout → new_ids + per_token_logps (pad/eos stripped)</text>
+
+  <line x1="460" y1="176" x2="460" y2="196" class="f2"/>
+  <rect x="290" y="196" width="340" height="54" rx="8" fill="#dbeafe" stroke="#2563eb" stroke-width="1.5"/>
+  <text x="460" y="217" text-anchor="middle" class="t2" fill="#2563eb" font-weight="bold">response_ids += new_ids · mask=1 · old_logps</text>
+  <text x="460" y="236" text-anchor="middle" class="s2">model tokens — trained</text>
+
+  <line x1="460" y1="250" x2="460" y2="272" class="f2"/>
+  <!-- decision diamond -->
+  <path d="M 460 272 L 610 308 L 460 344 L 310 308 Z" fill="#fff" stroke="#b45309" stroke-width="1.5"/>
+  <text x="460" y="303" text-anchor="middle" class="t2">&lt;tool_call&gt;...&gt; present?</text>
+  <text x="460" y="320" text-anchor="middle" class="s2">parse_tool_calls (regex, JSON)</text>
+
+  <line x1="610" y1="308" x2="700" y2="308" class="f2"/>
+  <text x="655" y="300" class="s2" fill="#059669">no</text>
+  <rect x="700" y="286" width="190" height="44" rx="8" class="d2"/>
+  <text x="795" y="304" text-anchor="middle" class="t2" fill="#059669">break → final answer</text>
+  <text x="795" y="321" text-anchor="middle" class="s2">turn_outputs[-1] = completion</text>
+
+  <line x1="460" y1="344" x2="460" y2="366" class="f2"/>
+  <text x="475" y="360" class="s2" fill="#b45309">yes</text>
+  <rect x="200" y="366" width="520" height="64" rx="8" class="b2"/>
+  <text x="460" y="387" text-anchor="middle" class="t2">execute_tool(name, args) per call — SIGALRM 1s timeout</text>
+  <text x="460" y="405" text-anchor="middle" class="s2">result JSON (≤2048 chars) appended as {"role":"tool"} messages</text>
+  <text x="460" y="422" text-anchor="middle" class="s2">unfinished = (turn == max_turns−1) · mock tools: math/unit/weather/time/fx/translate</text>
+
+  <line x1="460" y1="430" x2="460" y2="452" class="f2"/>
+  <rect x="250" y="452" width="420" height="56" rx="8" fill="#fef3c7" stroke="#b45309" stroke-width="1.5"/>
+  <text x="460" y="473" text-anchor="middle" class="t2" fill="#b45309">observe context → response_ids += obs_delta · mask=0 · logp=0</text>
+  <text x="460" y="492" text-anchor="middle" class="s2">environment tokens — masked out of the policy loss</text>
+
+  <path d="M 250 480 L 130 480 L 130 90 L 310 62" class="f2" stroke-dasharray="5 4"/>
+  <text x="140" y="200" class="s2" fill="#5b6472" transform="rotate(-90 140 200)">next turn (≤3)</text>
+  <text x="560" y="540" class="s2">returns: final_output, final_context, prompt_ids, response_ids, response_mask, response_old_logps, per-turn outputs, unfinished</text>
+</svg>
+<figcaption>Figure 2 — One trajectory. Model tokens accumulate at mask 1 with true logps; tool/observation tokens at mask 0. If the last turn still emitted tool calls, <code>unfinished=True</code> (penalized in reward).</figcaption>
+</figure>
+
+<div class="note"><b><code>rollout_batch</code></b> runs this per prompt × <code>num_generations</code> (default 4), deep-copying <code>messages</code> each time. Generation happens under <code>torch.no_grad()</code>; logps come from the engine so the update step can form the importance ratio without re-decoding.</div>
+
+<!-- ================================================================ 3. MASK -->
+<h2>3. Token stream &amp; loss mask</h2>
+<figure class="figure">
+<svg viewBox="0 0 920 230" width="100%" xmlns="http://www.w3.org/2000/svg">
+  <style>.lb{font-size:12px;fill:#1a1d23}.cap{font-size:11px;fill:#5b6472}</style>
+  <text x="20" y="24" class="lb" font-weight="bold">response_ids layout after packing (truncated to max_total_len = 2500, left-trim)</text>
+  <!-- prompt -->
+  <rect x="20" y="44" width="200" height="34" fill="#f6f8fa" stroke="#9aa3af" stroke-width="1.2"/>
+  <text x="120" y="65" text-anchor="middle" class="lb">prompt (mask 0)</text>
+  <!-- turn1 model -->
+  <rect x="220" y="44" width="150" height="34" fill="#dbeafe" stroke="#2563eb" stroke-width="1.2"/>
+  <text x="295" y="65" text-anchor="middle" class="lb" fill="#2563eb">turn 1 · mask 1</text>
+  <!-- env -->
+  <rect x="370" y="44" width="130" height="34" fill="#fef3c7" stroke="#b45309" stroke-width="1.2"/>
+  <text x="435" y="65" text-anchor="middle" class="lb" fill="#b45309">tool obs · 0</text>
+  <!-- turn2 model -->
+  <rect x="500" y="44" width="150" height="34" fill="#dbeafe" stroke="#2563eb" stroke-width="1.2"/>
+  <text x="575" y="65" text-anchor="middle" class="lb" fill="#2563eb">turn 2 · mask 1</text>
+  <!-- eos cut -->
+  <rect x="650" y="44" width="70" height="34" fill="#d1fae5" stroke="#059669" stroke-width="1.2"/>
+  <text x="685" y="65" text-anchor="middle" class="lb" fill="#059669">EOS</text>
+  <rect x="720" y="44" width="180" height="34" fill="#fee2e2" stroke="#dc2626" stroke-width="1.2" stroke-dasharray="4 3"/>
+  <text x="810" y="65" text-anchor="middle" class="lb" fill="#dc2626">after-EOS · masked out</text>
+  <text x="20" y="106" class="cap">old_logps: [0]·(prompt−1) + real logps on model tokens, 0 on env tokens — aligned to the shifted logits (input_ids[:, 1:])</text>
+  <text x="20" y="140" class="lb" font-weight="bold">completion_mask construction</text>
+  <text x="20" y="166" class="cap">full_response_masks[:, 1:] × (position ≤ first EOS index) — training stops gradient at the first EOS even across multi-turn streams</text>
+  <text x="20" y="200" class="cap">Rows with 0 valid tokens are dropped from the loss (valid_rows); token_counts normalizes per row.</text>
+</svg>
+<figcaption>Figure 3 — Mask semantics. Note <code>old_logps</code> is offset by <code>len(prompt) − 1</code> to line up with next-token logits.</figcaption>
+</figure>
+
+<!-- ================================================================ 4. REWARD -->
+<h2>4. Reward — <code>calculate_rewards</code> (clipped to ±3)</h2>
+<p>Per completion. Turn outputs are split on <code>&lt;/tool_call&gt;</code> to isolate think/answer spans; tool calls are re-parsed from all turns.</p>
+
+<table>
+  <tr><th>Component</th><th>Condition</th><th>Delta</th></tr>
+  <tr><td>Tag balance</td><td>per turn: |count(&lt;tool_call&gt;) − count(&gt;)|</td><td class="neg">−0.5 × Σ</td></tr>
+  <tr><td colspan="3"><b>Path A — no tool call (final answer)</b></td></tr>
+  <tr><td>Length</td><td>5 ≤ len(answer) ≤ 800</td><td class="pos">+0.5</td> <td class="neg">else −0.5</td></tr>
+  <tr><td>Think length</td><td>20 ≤ len(&lt;/tool_call&gt; body) ≤ 300</td><td class="pos">+1.0</td> <td class="neg">else −0.5</td></tr>
+  <tr><td>Think closure</td><td>exactly one <code>&lt;/tool_call&gt;</code></td><td class="pos">+0.25</td> <td class="neg">else −0.25</td></tr>
+  <tr><td>Reward model</td><td><code>reward_model.get_score(parsed_messages, answer)</code> — only if loaded</td><td class="pos">+ score</td></tr>
+  <tr><td>Repetition</td><td>trigram <code>rep_penalty</code> (cap 0.5)</td><td class="neg">− penalty</td></tr>
+  <tr><td colspan="3"><b>Path B — tool calls present</b></td></tr>
+  <tr><td>Call validity</td><td>name advertised in sample's <code>tools</code> AND args pass <code>CHECK_ARGS</code></td><td>counts toward <code>valid_call_count</code></td></tr>
+  <tr><td>Tool alignment</td><td><code>tool_gap = |valid − len(gt)| + max(0, invalid extras)</code>; gap 0</td><td class="pos">+0.5</td> <td class="neg">else −0.5 × gap</td></tr>
+  <tr><td>Ground truth</td><td><code>validate_gt_in_text</code>: substring or numeric match (±1e-6, comma-insensitive) in post-last-&gt; text</td><td class="pos">+2.5 × |verified| / |gt|</td></tr>
+  <tr><td>Unfinished</td><td>hit max_turns with pending calls</td><td class="neg">−0.5</td></tr>
+  <tr><td>Repetition</td><td>on final text</td><td class="neg">− penalty</td></tr>
+</table>
+
+<figure class="figure">
+<svg viewBox="0 0 920 330" width="100%" xmlns="http://www.w3.org/2000/svg">
+  <defs><marker id="a3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#1a1d23"/></marker></defs>
+  <style>.t3{font-size:13px;fill:#1a1d23}.s3{font-size:11px;fill:#5b6472}.f3{stroke:#1a1d23;stroke-width:1.4;fill:none;marker-end:url(#a3)}
+  .ok{fill:#d1fae5;stroke:#059669}.bd{fill:#fef3c7;stroke:#b45309}.er{fill:#fee2e2;stroke:#dc2626}</style>
+  <rect x="360" y="16" width="200" height="40" rx="8" fill="#fff" stroke="#d8dce3" stroke-width="1.5"/>
+  <text x="460" y="41" text-anchor="middle" class="t3">trajectory + turn outputs</text>
+  <line x1="460" y1="56" x2="460" y2="76" class="f3"/>
+  <path d="M 460 76 L 760 76 L 760 100 L 746 100" class="f3" opacity="0"/>
+  <path d="M 460 76 L 160 76 L 160 100 L 174 100" class="f3" opacity="0"/>
+  <path d="M 460 76 L 160 76 L 160 104" class="f3"/>
+  <path d="M 460 76 L 760 76 L 760 104" class="f3"/>
+  <text x="300" y="96" class="s3">has &lt;tool_call&gt;? no → A</text>
+  <text x="600" y="96" class="s3">yes → B</text>
+
+  <rect x="30" y="104" width="260" height="170" rx="8" class="ok"/>
+  <text x="160" y="126" text-anchor="middle" class="t3" fill="#059669" font-weight="bold">A · answer shaping</text>
+  <text x="45" y="150" class="s3">length 5..800 → ±0.5</text>
+  <text x="45" y="170" class="s3">&lt;/tool_call&gt; 20..300 chars → +1.0 / −0.5</text>
+  <text x="45" y="190" class="s3">single &lt;/tool_call&gt; → +0.25 / −0.25</text>
+  <text x="45" y="210" class="s3">+ reward_model score (optional)</text>
+  <text x="45" y="230" class="s3">− rep_penalty (trigram, cap 0.5)</text>
+  <text x="45" y="256" class="s3" font-weight="bold">clip to ±3</text>
+
+  <rect x="630" y="104" width="260" height="170" rx="8" class="bd"/>
+  <text x="760" y="126" text-anchor="middle" class="t3" fill="#b45309" font-weight="bold">B · tool correctness</text>
+  <text x="645" y="150" class="s3">valid = advertised name + CHECK_ARGS</text>
+  <text x="645" y="170" class="s3">gap = |valid−len(gt)| + invalid extras</text>
+  <text x="645" y="190" class="s3">gap==0 → +0.5 else −0.5·gap</text>
+  <text x="645" y="210" class="s3">GT in final text → +2.5·|hit|/|gt|</text>
+  <text x="645" y="230" class="s3">unfinished → −0.5 · − rep_penalty</text>
+  <text x="645" y="256" class="s3" font-weight="bold">clip to ±3</text>
+
+  <path d="M 160 274 L 160 296 L 420 296" class="f3"/>
+  <path d="M 760 274 L 760 296 L 500 296" class="f3"/>
+  <rect x="380" y="280" width="160" height="34" rx="8" class="er"/>
+  <text x="460" y="302" text-anchor="middle" class="t3" fill="#dc2626" font-weight="bold">rewards ∈ [−3, 3]</text>
+</svg>
+<figcaption>Figure 4 — Reward tree. Both paths share tag-balance and repetition penalties; the ±3 clip bounds group advantage spread.</figcaption>
+</figure>
+
+<!-- ================================================================ 5. TRAIN STEP -->
+<h2>5. Training step — <code>rl_train_epoch</code></h2>
+
+<figure class="figure">
+<svg viewBox="0 0 920 620" width="100%" xmlns="http://www.w3.org/2000/svg">
+  <defs><marker id="a4" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#1a1d23"/></marker></defs>
+  <style>.t4{font-size:13px;fill:#1a1d23}.s4{font-size:11px;fill:#5b6472}.f4{stroke:#1a1d23;stroke-width:1.4;fill:none;marker-end:url(#a4)}
+  .b4{fill:#fff;stroke:#d8dce3;stroke-width:1.5}.h4{font-size:14px;font-weight:bold}</style>
+  <text x="460" y="24" text-anchor="middle" class="h4">per loader step (no_grad rollout → grad update)</text>
+
+  <rect x="40" y="40" width="250" height="64" rx="8" class="b4"/>
+  <text x="165" y="62" text-anchor="middle" class="t4">1 · rollout_batch (no_grad)</text>
+  <text x="165" y="80" text-anchor="middle" class="s4">num_generations per prompt, ≤3 turns</text>
+  <text x="165" y="96" text-anchor="middle" class="s4">temp 0.8 · max_gen_len 768</text>
+
+  <rect x="335" y="40" width="250" height="64" rx="8" class="b4"/>
+  <text x="460" y="62" text-anchor="middle" class="t4">2 · pack + truncate</text>
+  <text x="460" y="80" text-anchor="middle" class="s4">prompt+response ≤ max_total_len 2500</text>
+  <text x="460" y="96" text-anchor="middle" class="s4">pad to batch max · prompt_len = first mask-1</text>
+
+  <rect x="630" y="40" width="250" height="64" rx="8" class="b4"/>
+  <text x="755" y="62" text-anchor="middle" class="t4">3 · calculate_rewards</text>
+  <text x="755" y="80" text-anchor="middle" class="s4">rule-based ± RM, clipped ±3</text>
+  <text x="755" y="96" text-anchor="middle" class="s4">(section 4)</text>
+
+  <rect x="335" y="150" width="250" height="76" rx="8" fill="#dbeafe" stroke="#2563eb" stroke-width="1.5"/>
+  <text x="460" y="173" text-anchor="middle" class="t4" fill="#2563eb" font-weight="bold">4 · policy forward (bf16)</text>
+  <text x="460" y="191" text-anchor="middle" class="s4">logits[:, :-1] → log_softmax</text>
+  <text x="460" y="208" text-anchor="middle" class="s4">gather per_token_logps + MoE aux_loss</text>
+
+  <rect x="335" y="260" width="250" height="60" rx="8" fill="#ede9fe" stroke="#7c3aed" stroke-width="1.5"/>
+  <text x="460" y="283" text-anchor="middle" class="t4" fill="#7c3aed" font-weight="bold">5 · ref logps (no_grad)</text>
+  <text x="460" y="301" text-anchor="middle" class="s4">compute_per_token_logps(ref_model)</text>
+
+  <rect x="40" y="150" width="250" height="64" rx="8" class="b4"/>
+  <text x="165" y="172" text-anchor="middle" class="t4">6 · advantage (group-relative)</text>
+  <text x="165" y="190" text-anchor="middle" class="s4">view(−1, num_generations)</text>
+  <text x="165" y="207" text-anchor="middle" class="s4">A = (r − mean) / (std + 1e-4)</text>
+
+  <rect x="630" y="150" width="250" height="64" rx="8" class="b4"/>
+  <text x="755" y="172" text-anchor="middle" class="t4">7 · EOS-cut completion_mask</text>
+  <text x="755" y="190" text-anchor="middle" class="s4">× (pos ≤ first EOS)</text>
+  <text x="755" y="207" text-anchor="middle" class="s4">drop rows with 0 valid tokens</text>
+
+  <rect x="180" y="370" width="560" height="120" rx="8" fill="#d1fae5" stroke="#059669" stroke-width="1.5"/>
+  <text x="460" y="394" text-anchor="middle" class="t4" fill="#059669" font-weight="bold">8 · per-token loss (choose via --loss_type)</text>
+  <text x="460" y="418" text-anchor="middle" class="s4" font-family="monospace">ratio = exp(logp_policy − logp_old) · kl = exp(k̂) − k̂ − 1, k̂ = logp_ref − logp</text>
+  <text x="460" y="444" text-anchor="middle" class="s4" font-family="monospace">cispo (default): −clamp(ratio, max=ε_high=5).detach · A · logp</text>
+  <text x="460" y="464" text-anchor="middle" class="s4" font-family="monospace">grpo: −min(ratio·A, clip(ratio, 1±ε=0.2)·A)</text>
+  <text x="460" y="482" text-anchor="middle" class="s4">both minus β=0.1 · per_token_kl → row-mean over valid tokens</text>
+
+  <rect x="180" y="530" width="270" height="56" rx="8" class="b4"/>
+  <text x="315" y="552" text-anchor="middle" class="t4">9 · loss = (policy + aux)/accum</text>
+  <text x="315" y="570" text-anchor="middle" class="s4">backward · every accum steps: clip 1.0 → step → scheduler</text>
+
+  <rect x="490" y="530" width="270" height="56" rx="8" class="b4"/>
+  <text x="625" y="552" text-anchor="middle" class="t4">10 · every save_interval</text>
+  <text x="625" y="570" text-anchor="middle" class="s4">fp16 state dict + full ckpt → rollout_engine.update_policy</text>
+
+  <path d="M 165 104 L 165 128 L 165 150" class="f4" opacity="0"/>
+  <line x1="290" y1="72" x2="335" y2="72" class="f4"/>
+  <line x1="585" y1="72" x2="630" y2="72" class="f4"/>
+  <path d="M 460 104 L 460 150" class="f4"/>
+  <path d="M 460 226 L 460 260" class="f4"/>
+  <path d="M 165 214 L 165 330 L 460 330 L 460 370" class="f4"/>
+  <path d="M 755 214 L 755 330 L 460 330" class="f4"/>
+  <path d="M 460 320 L 460 370" class="f4" opacity="0"/>
+  <path d="M 460 320 L 460 345 L 460 370" class="f4" opacity="0"/>
+  <path d="M 460 336 L 460 370" class="f4" opacity="0"/>
+  <path d="M 460 332 L 460 370" class="f4" opacity="0"/>
+  <path d="M 460 334 L 460 370" class="f4"/>
+  <path d="M 460 490 L 460 510 L 315 510 L 315 530" class="f4"/>
+  <path d="M 460 510 L 625 510 L 625 530" class="f4"/>
+</svg>
+<figcaption>Figure 5 — One optimization step. The detached clamped ratio in CISPO keeps the update on-policy-ish while <code>· logp</code> still provides gradient (no clipping of the gradient-bearing term).</figcaption>
+</figure>
+
+<h3>Logged metrics (console + wandb every <code>log_interval</code>)</h3>
+<pre><code>Epoch:[e/E](step/iters), Reward, KL(ref), GrpStd, AdvStd, Loss, AvgLen(completion tokens), AdvMean, LR
+wandb: reward, kl_ref, group_reward_std, advantages_std, policy_loss, avg_response_len, advantages_mean, learning_rate</code></pre>
+
+<!-- ================================================================ 6. ARGS -->
+<h2>6. Notable CLI flags</h2>
+<table>
+  <tr><th>Flag</th><th>Default</th><th>Notes</th></tr>
+  <tr><td><code>--loss_type</code></td><td><code>cispo</code></td><td>or <code>grpo</code> (PPO-style clip, ε=0.2)</td></tr>
+  <tr><td><code>--num_generations</code></td><td>4</td><td>group size for advantage normalization</td></tr>
+  <tr><td><code>--beta</code></td><td>0.1</td><td>KL penalty coefficient (k3 estimator)</td></tr>
+  <tr><td><code>--epsilon_high</code></td><td>5.0</td><td>CISPO ratio clamp upper bound</td></tr>
+  <tr><td><code>--thinking_ratio</code></td><td>0.1</td><td>probability a trajectory opens thinking mode</td></tr>
+  <tr><td><code>--max_total_len</code></td><td>2500</td><td>packed training length; left-truncated</td></tr>
+  <tr><td><code>--rollout_engine</code></td><td><code>torch</code></td><td>or <code>sglang</code> (server @ :8998, shared ckpt dir for weight sync)</td></tr>
+  <tr><td><code>--reward_model_path</code></td><td><code>../../internlm2-1_8b-reward</code></td><td>optional; only used in no-tool answers</td></tr>
+  <tr><td><code>--from_weight</code></td><td><code>full_sft</code></td><td>SFT checkpoint to start from; <code>--from_resume 1</code> continues agent runs</td></tr>
+  <tr><td><code>--debug_mode</code></td><td>off</td><td>dumps gt, full contexts, completions, per-sample rewards every <code>--debug_interval</code></td></tr>
+</table>
+
+<div class="note"><b>Gotchas.</b> Mock tools are deterministic lookup tables plus a sandboxed <code>eval</code> for math (1s SIGALRM guard) — trajectories are self-play against fixtures, not a live environment. <code>execute_tool</code>'s <code>signal.alarm</code> is POSIX-only. The dataset loader returns raw lists/dicts (custom <code>collate_fn</code>), and <code>rollout_engine.update_policy</code> must run after every load/save to keep generation in sync with training weights.</div>
+
+<p class="small" style="margin-top:3rem">Generated 2026-10-16 · derived from <code>trainer/train_agent.py</code> (branch <code>dev</code>). Companion doc: <a href="model_architecture.html">model_architecture.html</a>.</p>
+</div>
+</body>
+</html>
