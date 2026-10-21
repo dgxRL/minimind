@@ -310,6 +310,7 @@ python train_full_sft.py --from_resume 1
 - Checkpoint file naming: `<weight_name>_<dimension>_resume.pth` (e.g., `full_sft_512_resume.pth`)
 - Supports recovery across different GPU counts (automatically adjusts step)
 - Supports wandb training record continuity (automatically resumes the same run)
+- The checkpoint directory is set with `--checkpoint_dir` (default `../checkpoints`); `--from_weight` is read from `--from_dir` (default `../out`)
 
 > Suitable for long-duration training or unstable environments, no need to worry about progress loss due to training interruption
 
@@ -605,6 +606,22 @@ For reference, GPT-3's parameter settings are as follows:
 ![gpt3_config.png](./images/gpt3_config.png)
 
 </details>
+
+## Code Structure & Tests
+
+- `model/`: `model_minimind.py` (config and the whole network, kept in one file for `trust_remote_code` export), `model_io.py` (weight loading/saving), `model_lora.py`
+- `trainer/`: `engine.py` holds the one training loop (Template Method: each stage only implements `compute_loss`), `cli.py` the shared command-line flags, `losses.py` every objective, `rl_common.py` / `agent_env.py` the shared RL pieces, and each `train_*.py` is a thin entry point for one stage
+- Weight file names come from one place, `MiniMindConfig.weight_name()` (e.g. `full_sft_768_moe_kda`)
+
+Tests (about 30 s on CPU, no GPU or dataset download needed):
+
+```bash
+pip install pytest
+python -m pytest                 # everything
+python -m pytest -m "not slow"   # unit tests only
+```
+
+The suite covers model numerics (weights and outputs frozen before the refactor), step-by-step loss regression for every training script, unit tests for losses, rewards and datasets, and a snapshot of every script's command-line defaults. See [docs/code_structure.md](./docs/code_structure.md).
 
 ---
 

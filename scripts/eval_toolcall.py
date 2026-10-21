@@ -7,11 +7,11 @@ import time
 import random
 import argparse
 import warnings
-import torch
 from datetime import datetime
-from transformers import AutoTokenizer, AutoModelForCausalLM, TextStreamer
-from openai import OpenAI
-from model.model_minimind import MiniMindConfig, MiniMindForCausalLM
+from transformers import TextStreamer
+from model.model_io import load_minimind, weight_path
+from trainer.agent_env import parse_tool_calls
+from trainer.cli import add_inference_args, add_model_args, config_from_args, default_device
 from trainer.trainer_utils import setup_seed, get_model_params
 warnings.filterwarnings('ignore')
 
@@ -55,27 +55,10 @@ TEST_CASES = [
 
 
 def init_model(args):
-    tokenizer = AutoTokenizer.from_pretrained(args.load_from)
-    if 'model' in args.load_from:
-        model = MiniMindForCausalLM(MiniMindConfig(hidden_size=args.hidden_size, num_hidden_layers=args.num_hidden_layers, use_moe=bool(args.use_moe), use_kda=bool(args.use_kda), use_attnres=bool(args.use_attnres)))
-        moe_suffix = ('_moe' if args.use_moe else '') + ('_kda' if args.use_kda else '') + ('_attnres' if args.use_attnres else '')
-        ckp = f'./{args.save_dir}/{args.weight}_{args.hidden_size}{moe_suffix}.pth'
-        model.load_state_dict(torch.load(ckp, map_location=args.device), strict=True)
-    else:
-        model = AutoModelForCausalLM.from_pretrained(args.load_from, trust_remote_code=True)
+    config = config_from_args(args)
+    model, tokenizer = load_minimind(args.load_from, weight_path(f'./{args.save_dir}', args.weight, config), config, device=args.device)
     get_model_params(model, model.config)
     return model.half().eval().to(args.device), tokenizer
-
-
-def parse_tool_calls(text):
-    matches = re.findall(r'<tool_call>(.*?)</tool_call>', text, re.DOTALL)
-    calls = []
-    for m in matches:
-        try:
-            calls.append(json.loads(m.strip()))
-        except Exception:
-            pass
-    return calls
 
 
 def parse_tool_call_from_text(content):
@@ -199,31 +182,30 @@ def run_case(prompt, tools, args, model=None, tokenizer=None, client=None):
             messages.append({"role": "tool", "content": json.dumps(result, ensure_ascii=False)} if args.backend == 'local' else {"role": "tool", "content": json.dumps(result, ensure_ascii=False), "tool_call_id": tc["id"]})
 
 
-def main():
+def build_parser():
     parser = argparse.ArgumentParser(description="MiniMind ToolCall评测")
     parser.add_argument('--backend', default='local', choices=['local', 'api'], type=str, help="推理后端（local=本地模型，api=OpenAI兼容接口）")
-    parser.add_argument('--load_from', default='../model', type=str, help="模型加载路径（model=原生torch权重，其他路径=transformers格式）")
-    parser.add_argument('--save_dir', default='../out', type=str, help="模型权重目录")
-    parser.add_argument('--weight', default='full_sft', type=str, help="权重名称前缀（pretrain, full_sft, rlhf, reason, ppo_actor, grpo, spo）")
-    parser.add_argument('--hidden_size', default=768, type=int, help="隐藏层维度")
-    parser.add_argument('--num_hidden_layers', default=8, type=int, help="隐藏层数量")
-    parser.add_argument('--use_moe', default=0, type=int, choices=[0, 1], help="是否使用MoE架构（0=否，1=是）")
-    parser.add_argument('--use_kda', default=0, type=int, choices=[0, 1], help="是否使用KDA线性注意力混合架构（0=否，1=是）")
-    parser.add_argument('--use_attnres', default=0, type=int, choices=[0, 1], help="是否使用注意力残差Block AttnRes（0=否，1=是）")
+    add_inference_args(parser, load_from='../model', save_dir='../out')
+    add_model_args(parser)
     parser.add_argument('--max_new_tokens', default=512, type=int, help="最大生成长度")
     parser.add_argument('--temperature', default=0.9, type=float, help="生成温度，控制随机性（0-1，越大越随机）")
     parser.add_argument('--top_p', default=0.9, type=float, help="nucleus采样阈值（0-1）")
     parser.add_argument('--show_speed', default=0, type=int, help="显示decode速度（tokens/s）")
-    parser.add_argument('--device', default='cuda' if torch.cuda.is_available() else 'cpu', type=str, help="运行设备")
+    parser.add_argument('--device', default=default_device(index=False), type=str, help="运行设备")
     parser.add_argument('--api_base_url', default="http://localhost:11434/v1", type=str, help="OpenAI兼容接口的base_url")
     parser.add_argument('--api_key', default='sk-123', type=str, help="OpenAI兼容接口的api_key")
     parser.add_argument('--api_model', default='jingyaogong/minimind-3:latest', type=str, help="API请求时使用的模型名称")
     parser.add_argument('--stream', default=1, type=int, help="API模式下是否流式输出（0=否，1=是）")
-    args = parser.parse_args()
+    return parser
 
+
+def main():
+    args = build_parser().parse_args()
     model = tokenizer = client = None
     if args.backend == 'local': model, tokenizer = init_model(args)
-    else: client = OpenAI(api_key=args.api_key, base_url=args.api_base_url)
+    else:
+        from openai import OpenAI
+        client = OpenAI(api_key=args.api_key, base_url=args.api_base_url)
 
     input_mode = int(input('[0] 自动测试\n[1] 手动输入\n'))
 

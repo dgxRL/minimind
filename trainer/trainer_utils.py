@@ -1,5 +1,5 @@
 """
-训练工具函数集合
+训练工具函数集合 — process/distributed helpers, LR schedule, checkpoints, model init, resumable sampler, reward model wrapper.
 """
 import os
 import sys
@@ -10,10 +10,14 @@ import math
 import numpy as np
 import torch
 import torch.distributed as dist
-from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import Sampler
-from transformers import AutoTokenizer, AutoModel, AutoModelForSequenceClassification
+from transformers import AutoTokenizer, AutoModel
 from model.model_minimind import MiniMindForCausalLM
+from model.model_io import unwrap_model, half_state_dict, atomic_save, weight_path
+
+ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+TOKENIZER_DIR = os.path.join(ROOT_DIR, 'model')
+
 
 def get_model_params(model, config):
     total = sum(p.numel() for p in model.parameters()) / 1e6
@@ -32,16 +36,22 @@ def is_main_process():
     return not dist.is_initialized() or dist.get_rank() == 0
 
 
+def world_size():
+    return dist.get_world_size() if dist.is_initialized() else 1
+
+
 def Logger(content):
     if is_main_process():
         print(content)
 
 
 def get_lr(current_step, total_steps, lr):
+    """Cosine decay from 1.0·lr to 0.1·lr over total_steps."""
     return lr*(0.1 + 0.45*(1 + math.cos(math.pi * current_step / total_steps)))
 
 
 def init_distributed_mode():
+    """Join the torchrun process group if launched by torchrun; returns the local rank (0 when not distributed)."""
     if int(os.environ.get("RANK", -1)) == -1:
         return 0  # 非DDP模式
 
@@ -60,55 +70,44 @@ def setup_seed(seed: int):
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
+
+def _wandb_run_id(wandb):
+    if not wandb: return None
+    if hasattr(wandb, 'get_run'):
+        run = wandb.get_run()
+        return getattr(run, 'id', None) if run else None
+    return getattr(wandb, 'id', None)
+
+
 def lm_checkpoint(lm_config, weight='full_sft', model=None, optimizer=None, epoch=0, step=0, wandb=None, save_dir='../checkpoints', **kwargs):
+    """Save mode (model given): write <weight>.pth and <weight>_resume.pth (model, optimizer, progress, plus any extra
+    kwargs such as scaler/scheduler/critic_model). Load mode (model=None): return the resume dict or None."""
     os.makedirs(save_dir, exist_ok=True)
-    moe_path = ('_moe' if lm_config.use_moe else '') + ('_kda' if lm_config.use_kda else '') + ('_attnres' if lm_config.use_attnres else '')
-    ckp_path = f'{save_dir}/{weight}_{lm_config.hidden_size}{moe_path}.pth'
-    resume_path = f'{save_dir}/{weight}_{lm_config.hidden_size}{moe_path}_resume.pth'
+    ckp_path = weight_path(save_dir, weight, lm_config)
+    resume_path = ckp_path[:-len('.pth')] + '_resume.pth'
 
     if model is not None:
-        raw_model = model.module if isinstance(model, DistributedDataParallel) else model
-        raw_model = getattr(raw_model, '_orig_mod', raw_model)
-        state_dict = raw_model.state_dict()
-        state_dict = {k: v.half().cpu() for k, v in state_dict.items()}
-        ckp_tmp = ckp_path + '.tmp'
-        torch.save(state_dict, ckp_tmp)
-        os.replace(ckp_tmp, ckp_path)
-        wandb_id = None
-        if wandb:
-            if hasattr(wandb, 'get_run'):
-                run = wandb.get_run()
-                wandb_id = getattr(run, 'id', None) if run else None
-            else:
-                wandb_id = getattr(wandb, 'id', None)
-
+        state_dict = half_state_dict(model)
+        atomic_save(state_dict, ckp_path)
         resume_data = {
             'model': state_dict,
             'optimizer': optimizer.state_dict(),
             'epoch': epoch,
             'step': step,
-            'world_size': dist.get_world_size() if dist.is_initialized() else 1,
-            'wandb_id': wandb_id
+            'world_size': world_size(),
+            'wandb_id': _wandb_run_id(wandb)
         }
         for key, value in kwargs.items():
             if value is not None:
-                if hasattr(value, 'state_dict'):
-                    raw_value = value.module if isinstance(value, DistributedDataParallel) else value
-                    raw_value = getattr(raw_value, '_orig_mod', raw_value)
-                    resume_data[key] = raw_value.state_dict()
-                else:
-                    resume_data[key] = value
-
-        resume_tmp = resume_path + '.tmp'
-        torch.save(resume_data, resume_tmp)
-        os.replace(resume_tmp, resume_path)
+                resume_data[key] = unwrap_model(value).state_dict() if hasattr(value, 'state_dict') else value
+        atomic_save(resume_data, resume_path)
         del state_dict, resume_data
         torch.cuda.empty_cache()
     else:  # 加载模式
         if os.path.exists(resume_path):
             ckp_data = torch.load(resume_path, map_location='cpu')
             saved_ws = ckp_data.get('world_size', 1)
-            current_ws = dist.get_world_size() if dist.is_initialized() else 1
+            current_ws = world_size()
             if saved_ws != current_ws:
                 ckp_data['step'] = ckp_data['step'] * saved_ws // current_ws
                 Logger(f'GPU数量变化({saved_ws}→{current_ws})，step已自动转换为{ckp_data["step"]}')
@@ -116,14 +115,13 @@ def lm_checkpoint(lm_config, weight='full_sft', model=None, optimizer=None, epoc
         return None
 
 
-def init_model(lm_config, from_weight='pretrain', tokenizer_path='../model', save_dir='../out', device='cuda'):
+def init_model(lm_config, from_weight='pretrain', tokenizer_path=TOKENIZER_DIR, save_dir='../out', device='cuda'):
+    """Build MiniMindForCausalLM(lm_config); unless from_weight == 'none', load <save_dir>/<from_weight>_<size><suffix>.pth."""
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
     model = MiniMindForCausalLM(lm_config)
 
-    if from_weight!= 'none':
-        moe_suffix = ('_moe' if lm_config.use_moe else '') + ('_kda' if lm_config.use_kda else '') + ('_attnres' if lm_config.use_attnres else '')
-        weight_path = f'{save_dir}/{from_weight}_{lm_config.hidden_size}{moe_suffix}.pth'
-        weights = torch.load(weight_path, map_location=device)
+    if from_weight != 'none':
+        weights = torch.load(weight_path(save_dir, from_weight, lm_config), map_location=device)
         model.load_state_dict(weights, strict=False)
 
     get_model_params(model, lm_config)
@@ -132,6 +130,7 @@ def init_model(lm_config, from_weight='pretrain', tokenizer_path='../model', sav
 
 
 class SkipBatchSampler(Sampler):
+    """Batches indices from `sampler`, dropping the first `skip_batches` batches (used to resume mid-epoch)."""
     def __init__(self, sampler, batch_size, skip_batches=0):
         self.sampler = sampler
         self.batch_size = batch_size
@@ -158,6 +157,7 @@ class SkipBatchSampler(Sampler):
 
 
 class LMForRewardModel:
+    """InternLM2 reward model wrapper: score(conversation, response) clipped to [-3, 3]."""
     def __init__(self, model_path, device="cuda", dtype=torch.float16):
         self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
         self.model = AutoModel.from_pretrained(model_path, torch_dtype=dtype, trust_remote_code=True)

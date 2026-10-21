@@ -131,14 +131,14 @@ if __name__ == '__main__':
     lm_config = MiniMindConfig(hidden_size=768, num_hidden_layers=8, max_seq_len=8192, use_moe=False)
 
     # convert torch to transformers
-    torch_path = f"../out/full_sft_{lm_config.hidden_size}{'_moe' if lm_config.use_moe else ''}.pth"
+    torch_path = f"../out/{lm_config.weight_name('full_sft')}.pth"
     transformers_path = '../minimind-3'
     convert_torch2transformers(torch_path, transformers_path)
 
     # # merge lora
-    # base_torch_path = f"../out/full_sft_{lm_config.hidden_size}{'_moe' if lm_config.use_moe else ''}.pth"
-    # lora_path = f"../out/lora_identity_{lm_config.hidden_size}{'_moe' if lm_config.use_moe else ''}.pth"
-    # merged_torch_path = f"../out/merge_identity_{lm_config.hidden_size}{'_moe' if lm_config.use_moe else ''}.pth"
+    # base_torch_path = f"../out/{lm_config.weight_name('full_sft')}.pth"
+    # lora_path = f"../out/{lm_config.weight_name('lora_identity')}.pth"
+    # merged_torch_path = f"../out/{lm_config.weight_name('merge_identity')}.pth"
     # convert_merge_base_lora(base_torch_path, lora_path, merged_torch_path)
 
     # convert_transformers2torch(transformers_path, torch_path)

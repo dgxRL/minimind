@@ -14,7 +14,7 @@ import torch.distributed as dist
 from abc import ABC, abstractmethod
 from contextlib import nullcontext
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import List, Optional
 from torch import Tensor
 from torch.nn.parallel import DistributedDataParallel
 from transformers import AutoTokenizer
@@ -39,6 +39,8 @@ def compute_per_token_logps(model, input_ids: Tensor, n_keep: int, attention_mas
 # ===== Rollout 结果 =====
 @dataclass
 class RolloutResult:
+    """Sampled sequences for prompt_ids repeated num_generations times (sample-major).
+    output_ids [N, P+R] prompt + completion; completion_ids / per_token_logps / completion_mask [N, R]; prompt_lens [N]."""
     output_ids: Tensor
     completion_ids: Tensor
     per_token_logps: Tensor
@@ -49,6 +51,7 @@ class RolloutResult:
 
 # ===== Rollout 引擎抽象基类 =====
 class RolloutEngine(ABC):
+    """Strategy interface: trainers only call rollout() and update_policy(), so the sampler backend is swappable."""
     tokenizer = None
     
     @abstractmethod
@@ -201,7 +204,7 @@ class SGLangRolloutEngine(RolloutEngine):
         try:
             resp = self.http.get(f"{self.base_url}/health", timeout=5)
             return resp.status_code == 200
-        except:
+        except Exception:
             return False
 
 

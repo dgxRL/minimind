@@ -3,7 +3,7 @@ import torch
 import json
 import os
 import random
-from datasets import load_dataset, Features, Sequence, Value
+from datasets import load_dataset, Features, Value
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 def pre_processing_chat(conversations, add_system_ratio=0.2):
@@ -28,6 +28,35 @@ def pre_processing_chat(conversations, add_system_ratio=0.2):
             return [{'role': 'system', 'content': random.choice(SYSTEM_PROMPTS)}] + conversations
     return conversations
 
+def assistant_spans(input_ids, bos_id, eos_id, max_length):
+    """Token ranges the model is trained on: everything after each `<|im_start|>assistant\n` marker (bos_id) up to and
+    including the next `<|im_end|>\n` (eos_id), clipped to max_length. An unterminated reply runs to the end."""
+    spans, i = [], 0
+    while i < len(input_ids):
+        if input_ids[i:i + len(bos_id)] == bos_id:
+            start = end = i + len(bos_id)
+            while end < len(input_ids) and input_ids[end:end + len(eos_id)] != eos_id:
+                end += 1
+            spans.append(range(start, min(end + len(eos_id), max_length)))
+            i = end + len(eos_id) if end < len(input_ids) else len(input_ids)
+        else:
+            i += 1
+    return spans
+
+
+def split_tools(conversations):
+    """Copy the messages, decode JSON-string `tool_calls`, and pull the tool schema list out of the system message."""
+    messages, tools = [], None
+    for message in conversations:
+        message = dict(message)
+        if message.get("role") == "system" and message.get("tools"):
+            tools = json.loads(message["tools"]) if isinstance(message["tools"], str) else message["tools"]
+        if message.get("tool_calls") and isinstance(message["tool_calls"], str):
+            message["tool_calls"] = json.loads(message["tool_calls"])
+        messages.append(message)
+    return messages, tools
+
+
 def post_processing_chat(prompt_content, empty_think_ratio=0.2):
     # 以80%概率移除空思考标签
     if '<think>\n\n</think>\n\n' in prompt_content and random.random() > empty_think_ratio:
@@ -35,6 +64,7 @@ def post_processing_chat(prompt_content, empty_think_ratio=0.2):
     return prompt_content
 
 class PretrainDataset(Dataset):
+    """Plain text -> [BOS] tokens [EOS] + padding; loss on every non-pad token."""
     def __init__(self, data_path, tokenizer, max_length=512):
         super().__init__()
         self.tokenizer = tokenizer
@@ -56,6 +86,7 @@ class PretrainDataset(Dataset):
 
 
 class SFTDataset(Dataset):
+    """Chat conversations rendered with the chat template; loss only on assistant replies (labels -100 elsewhere)."""
     def __init__(self, jsonl_path, tokenizer, max_length=1024):
         super().__init__()
         self.tokenizer = tokenizer
@@ -69,15 +100,7 @@ class SFTDataset(Dataset):
         return len(self.samples)
 
     def create_chat_prompt(self, conversations):
-        messages = []
-        tools = None
-        for message in conversations:
-            message = dict(message)
-            if message.get("role") == "system" and message.get("tools"):
-                tools = json.loads(message["tools"]) if isinstance(message["tools"], str) else message["tools"]
-            if message.get("tool_calls") and isinstance(message["tool_calls"], str):
-                message["tool_calls"] = json.loads(message["tool_calls"])
-            messages.append(message)
+        messages, tools = split_tools(conversations)
         return self.tokenizer.apply_chat_template(
             messages,
             tokenize=False,
@@ -87,20 +110,8 @@ class SFTDataset(Dataset):
 
     def generate_labels(self, input_ids):
         labels = [-100] * len(input_ids)
-        i = 0
-        while i < len(input_ids):
-            if input_ids[i:i + len(self.bos_id)] == self.bos_id:
-                start = i + len(self.bos_id)
-                end = start
-                while end < len(input_ids):
-                    if input_ids[end:end + len(self.eos_id)] == self.eos_id:
-                        break
-                    end += 1
-                for j in range(start, min(end + len(self.eos_id), self.max_length)):
-                    labels[j] = input_ids[j]
-                i = end + len(self.eos_id) if end < len(input_ids) else len(input_ids)
-            else:
-                i += 1
+        for span in assistant_spans(input_ids, self.bos_id, self.eos_id, self.max_length):
+            for j in span: labels[j] = input_ids[j]
         return labels
 
     def __getitem__(self, index):
@@ -111,15 +122,11 @@ class SFTDataset(Dataset):
         input_ids = self.tokenizer(prompt).input_ids[:self.max_length]
         input_ids += [self.tokenizer.pad_token_id] * (self.max_length - len(input_ids))
         labels = self.generate_labels(input_ids)
-        # # === 调试打印 ===
-        # print(f"\n--- Sample {index} ---")
-        # for i, (x, y) in enumerate(zip(input_ids[:-1], labels[1:])):
-        #     print(f"{i:3d}: X={self.tokenizer.decode([x])!r:16s} ---> Y={self.tokenizer.decode([input_ids[i+1]])!r:16s} label={y}")
-        # # ================
         return torch.tensor(input_ids, dtype=torch.long), torch.tensor(labels, dtype=torch.long)
 
 
 class DPODataset(Dataset):
+    """Chosen / rejected conversation pairs; returns shifted inputs, targets and an assistant-only loss mask for each."""
     def __init__(self, file_path, tokenizer, max_length=4096):
         super().__init__()
         self.tokenizer = tokenizer
@@ -175,24 +182,13 @@ class DPODataset(Dataset):
 
     def generate_loss_mask(self, input_ids):
         loss_mask = [0] * len(input_ids)
-        i = 0
-        while i < len(input_ids):
-            if input_ids[i:i + len(self.bos_id)] == self.bos_id:
-                start = i + len(self.bos_id)
-                end = start
-                while end < len(input_ids):
-                    if input_ids[end:end + len(self.eos_id)] == self.eos_id:
-                        break
-                    end += 1
-                for j in range(start, min(end + len(self.eos_id), self.max_length)):
-                    loss_mask[j] = 1
-                i = end + len(self.eos_id) if end < len(input_ids) else len(input_ids)
-            else:
-                i += 1
+        for span in assistant_spans(input_ids, self.bos_id, self.eos_id, self.max_length):
+            for j in span: loss_mask[j] = 1
         return loss_mask
 
 
 class RLAIFDataset(Dataset):
+    """Prompts only (all turns but the last, with a generation prompt); thinking is switched on with probability thinking_ratio."""
     def __init__(self, jsonl_path, tokenizer, max_length=1024, thinking_ratio=0.5):
         super().__init__()
         self.tokenizer = tokenizer
@@ -224,6 +220,7 @@ class RLAIFDataset(Dataset):
         }
 
 class AgentRLDataset(Dataset):
+    """Tool-use prompts: messages without the final reply, the tool schemas, and the ground-truth answers `gt`."""
     def __init__(self, jsonl_path, tokenizer, max_length=1024):
         super().__init__()
         self.tokenizer = tokenizer
@@ -237,20 +234,15 @@ class AgentRLDataset(Dataset):
         return len(self.samples)
 
     def parse_conversations(self, conversations):
-        messages = []
-        tools = None
+        messages, tools = [], None
         for message in conversations:
             message = dict(message)
             if message.get("role") == "system" and message.get("tools"):
                 tools = json.loads(message["tools"]) if isinstance(message["tools"], str) else message["tools"]
-            messages.append(message)
+            messages.append(message)  # unlike split_tools, string tool_calls stay as-is: the rollout re-renders them verbatim
         return messages[:-1], tools
 
     def __getitem__(self, index):
         sample = self.samples[index]
         messages, tools = self.parse_conversations(sample['conversations'])
         return {'messages': messages, 'tools': tools, 'gt': sample['gt']}
-
-
-if __name__ == "__main__":
-    pass

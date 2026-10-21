@@ -2,44 +2,24 @@ import time
 import argparse
 import random
 import warnings
-import torch
-from transformers import AutoTokenizer, AutoModelForCausalLM, TextStreamer
-from model.model_minimind import MiniMindConfig, MiniMindForCausalLM
-from model.model_lora import *
+from transformers import TextStreamer
+from model.model_io import load_minimind, weight_path
+from trainer.cli import add_inference_args, add_model_args, config_from_args, default_device
 from trainer.trainer_utils import setup_seed, get_model_params
 warnings.filterwarnings('ignore')
 
 def init_model(args):
-    tokenizer = AutoTokenizer.from_pretrained(args.load_from)
-    if 'model' in args.load_from:
-        model = MiniMindForCausalLM(MiniMindConfig(
-            hidden_size=args.hidden_size,
-            num_hidden_layers=args.num_hidden_layers,
-            use_moe=bool(args.use_moe), use_kda=bool(args.use_kda), use_attnres=bool(args.use_attnres),
-            inference_rope_scaling=args.inference_rope_scaling
-        ))
-        moe_suffix = ('_moe' if args.use_moe else '') + ('_kda' if args.use_kda else '') + ('_attnres' if args.use_attnres else '')
-        ckp = f'./{args.save_dir}/{args.weight}_{args.hidden_size}{moe_suffix}.pth'
-        model.load_state_dict(torch.load(ckp, map_location=args.device), strict=True)
-        if args.lora_weight != 'None':
-            apply_lora(model)
-            load_lora(model, f'./{args.save_dir}/{args.lora_weight}_{args.hidden_size}.pth')
-    else:
-        model = AutoModelForCausalLM.from_pretrained(args.load_from, trust_remote_code=True)
+    config = config_from_args(args, inference_rope_scaling=args.inference_rope_scaling)
+    lora_file = f'./{args.save_dir}/{args.lora_weight}_{args.hidden_size}.pth' if args.lora_weight != 'None' else None
+    model, tokenizer = load_minimind(args.load_from, weight_path(f'./{args.save_dir}', args.weight, config), config, lora_file, args.device)
     get_model_params(model, model.config)
     return model.half().eval().to(args.device), tokenizer
 
-def main():
+def build_parser():
     parser = argparse.ArgumentParser(description="MiniMind模型推理与对话")
-    parser.add_argument('--load_from', default='model', type=str, help="模型加载路径（model=原生torch权重，其他路径=transformers格式）")
-    parser.add_argument('--save_dir', default='out', type=str, help="模型权重目录")
-    parser.add_argument('--weight', default='full_sft', type=str, help="权重名称前缀（pretrain, full_sft, rlhf, reason, ppo_actor, grpo, spo）")
+    add_inference_args(parser, load_from='model', save_dir='out')
     parser.add_argument('--lora_weight', default='None', type=str, help="LoRA权重名称（None表示不使用，可选：lora_identity, lora_medical）")
-    parser.add_argument('--hidden_size', default=768, type=int, help="隐藏层维度")
-    parser.add_argument('--num_hidden_layers', default=8, type=int, help="隐藏层数量")
-    parser.add_argument('--use_moe', default=0, type=int, choices=[0, 1], help="是否使用MoE架构（0=否，1=是）")
-    parser.add_argument('--use_kda', default=0, type=int, choices=[0, 1], help="是否使用KDA线性注意力混合架构（0=否，1=是）")
-    parser.add_argument('--use_attnres', default=0, type=int, choices=[0, 1], help="是否使用注意力残差Block AttnRes（0=否，1=是）")
+    add_model_args(parser)
     parser.add_argument('--inference_rope_scaling', default=False, action='store_true', help="启用RoPE位置编码外推（4倍，仅解决位置编码问题）")
     parser.add_argument('--max_new_tokens', default=8192, type=int, help="最大生成长度（注意：并非模型实际长文本能力）")
     parser.add_argument('--temperature', default=0.85, type=float, help="生成温度，控制随机性（0-1，越大越随机）")
@@ -47,9 +27,12 @@ def main():
     parser.add_argument('--open_thinking', default=0, type=int, help="是否开启自适应思考（0=否，1=是）")
     parser.add_argument('--historys', default=0, type=int, help="携带历史对话轮数（需为偶数，0表示不携带历史）")
     parser.add_argument('--show_speed', default=1, type=int, help="显示decode速度（tokens/s）")
-    parser.add_argument('--device', default='cuda' if torch.cuda.is_available() else 'cpu', type=str, help="运行设备")
-    args = parser.parse_args()
-    
+    parser.add_argument('--device', default=default_device(index=False), type=str, help="运行设备")
+    return parser
+
+def main():
+    args = build_parser().parse_args()
+
     prompts = [
         '你有什么特长？',
         '为什么天空是蓝色的',

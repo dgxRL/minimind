@@ -311,6 +311,7 @@ python train_full_sft.py --from_resume 1
 - 检查点文件命名：`<权重名>_<维度>_resume.pth`（如：`full_sft_512_resume.pth`）
 - 支持跨不同 GPU 数量恢复（自动调整 step）
 - 支持 wandb 训练记录连续性（自动恢复同一个 run）
+- 检查点目录可用 `--checkpoint_dir` 指定（默认 `../checkpoints`）；`--from_weight` 的读取目录可用 `--from_dir` 指定（默认 `../out`）
 
 > 适合长时间训练或不稳定环境，无需担心训练中断导致进度丢失
 
@@ -606,6 +607,22 @@ MobileLLM 的一个核心观察是：在参数量固定时，深度往往比宽�
 ![gpt3_config.png](./images/gpt3_config.png)
 
 </details>
+
+## 代码结构与测试
+
+- `model/`：`model_minimind.py`（配置与完整网络，单文件以便 `trust_remote_code` 导出）、`model_io.py`（权重加载/保存）、`model_lora.py`
+- `trainer/`：`engine.py` 统一训练循环（模板方法：各阶段只需实现 `compute_loss`），`cli.py` 共享命令行参数，`losses.py` 汇总所有目标函数，`rl_common.py` / `agent_env.py` 为强化学习公共组件，`train_*.py` 每个训练阶段一个精简入口
+- 权重命名统一由 `MiniMindConfig.weight_name()` 生成（如 `full_sft_768_moe_kda`）
+
+测试（CPU 约 30 秒，无需 GPU 或下载数据）：
+
+```bash
+pip install pytest
+python -m pytest                 # 全部测试
+python -m pytest -m "not slow"   # 仅单元测试
+```
+
+测试包含模型数值回归（重构前冻结的权重与输出）、各训练脚本逐步损失回归、损失函数/奖励/数据集的单元测试，以及所有脚本命令行参数默认值的快照校验。详见 [docs/code_structure.md](./docs/code_structure.md)。
 
 ---
 

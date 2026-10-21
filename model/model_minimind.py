@@ -12,7 +12,12 @@ except ImportError:
 #                                     MiniMind Config
 # 🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏
 class MiniMindConfig(PretrainedConfig):
+    """Hyper-parameters of MiniMind. The three architecture switches are independent:
+    use_moe (MoE FFN), use_kda (Kimi Delta Attention hybrid), use_attnres (Attention Residuals)."""
     model_type = "minimind"
+    # architecture switches that change the weight layout, in the order they appear in weight file names
+    WEIGHT_SUFFIXES = (("use_moe", "_moe"), ("use_kda", "_kda"), ("use_attnres", "_attnres"))
+
     def __init__(self, hidden_size=768, num_hidden_layers=8, use_moe=False, use_kda=False, use_attnres=False, **kwargs):
         super().__init__(**kwargs)
         self.hidden_size = hidden_size
@@ -65,6 +70,10 @@ class MiniMindConfig(PretrainedConfig):
         # block size counted in sub-layers (each Transformer layer = attention + MLP = 2 sub-layers):
         # 1 -> Full AttnRes, 2 -> one block per layer (8 blocks for 8 layers, the paper's N≈8), 2*num_hidden_layers -> one block
         self.attnres_block_size = kwargs.get("attnres_block_size", 2)
+
+    def weight_name(self, prefix: str) -> str:
+        """File stem used by every trainer and script, e.g. weight_name('pretrain') -> 'pretrain_768_moe_kda'."""
+        return f"{prefix}_{self.hidden_size}" + "".join(suffix for flag, suffix in self.WEIGHT_SUFFIXES if getattr(self, flag, False))
 
 # 🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏
 #                                     MiniMind Model
@@ -368,13 +377,22 @@ class AttnRes(nn.Module):
         alpha = logits.softmax(0)
         return sum(a.to(v.dtype).unsqueeze(-1) * v for a, (v, _) in zip(alpha, sources))
 
+def build_token_mixer(config: MiniMindConfig, layer_id: int) -> nn.Module:
+    """Factory for the sequence-mixing sub-layer; both choices share forward(x, position_embeddings, past_key_value, use_cache, attention_mask)."""
+    return KimiDeltaAttention(config) if config.layer_types[layer_id] == "kda" else Attention(config)
+
+def build_feed_forward(config: MiniMindConfig) -> nn.Module:
+    """Factory for the channel-mixing sub-layer."""
+    return MOEFeedForward(config) if config.use_moe else FeedForward(config)
+
 class MiniMindBlock(nn.Module):
+    """Pre-norm Transformer layer: token mixer + FFN, joined either by plain residual adds or by Attention Residuals."""
     def __init__(self, layer_id: int, config: MiniMindConfig):
         super().__init__()
-        self.self_attn = KimiDeltaAttention(config) if config.layer_types[layer_id] == "kda" else Attention(config)
+        self.self_attn = build_token_mixer(config, layer_id)
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.mlp = FeedForward(config) if not config.use_moe else MOEFeedForward(config)
+        self.mlp = build_feed_forward(config)
         if config.use_attnres:
             self.attn_res, self.mlp_res = AttnRes(config), AttnRes(config)
             # close the current block after the attention / MLP sub-layer (sub-layer index 2*layer_id, 2*layer_id+1)
@@ -411,6 +429,7 @@ class MiniMindBlock(nn.Module):
         return (blocks, partial), present_key_value
 
 class MiniMindModel(nn.Module):
+    """Embedding -> N blocks -> final norm. Returns (hidden_states, per-layer cache entries, summed MoE aux loss)."""
     def __init__(self, config: MiniMindConfig):
         super().__init__()
         self.config = config
@@ -470,6 +489,35 @@ class MiniMindModel(nn.Module):
         aux_loss = sum([l.mlp.aux_loss for l in self.layers if isinstance(l.mlp, MOEFeedForward)], hidden_states.new_zeros(1).squeeze())
         return hidden_states, presents, aux_loss
 
+# ── sampling: each step edits the next-token logits in place, then sample_next_token picks a token ──
+def apply_repetition_penalty(logits, input_ids, penalty):
+    """CTRL-style penalty on every token already present in the row: positive logits / penalty, negative * penalty."""
+    for i in range(input_ids.shape[0]):
+        seen = torch.unique(input_ids[i])
+        score = logits[i, seen]
+        logits[i, seen] = torch.where(score > 0, score / penalty, score * penalty)
+    return logits
+
+def apply_top_k(logits, top_k):
+    """Keep only the top_k largest logits per row."""
+    logits[logits < torch.topk(logits, top_k)[0][..., -1, None]] = -float('inf')
+    return logits
+
+def apply_top_p(logits, top_p):
+    """Nucleus filtering: keep the smallest set of tokens whose probability mass exceeds top_p (always at least one)."""
+    sorted_logits, sorted_indices = torch.sort(logits, descending=True)
+    mask = torch.cumsum(torch.softmax(sorted_logits, dim=-1), dim=-1) > top_p
+    mask[..., 1:], mask[..., 0] = mask[..., :-1].clone(), 0
+    logits[mask.scatter(1, sorted_indices, mask)] = -float('inf')
+    return logits
+
+def sample_next_token(logits, input_ids, do_sample=True, top_k=50, top_p=0.85, repetition_penalty=1.0):
+    """[B, V] temperature-scaled logits -> [B, 1] next token ids."""
+    if repetition_penalty != 1.0: logits = apply_repetition_penalty(logits, input_ids, repetition_penalty)
+    if top_k > 0: logits = apply_top_k(logits, top_k)
+    if top_p < 1.0: logits = apply_top_p(logits, top_p)
+    return torch.multinomial(torch.softmax(logits, dim=-1), num_samples=1) if do_sample else torch.argmax(logits, dim=-1, keepdim=True)
+
 class MiniMindForCausalLM(PreTrainedModel, GenerationMixin):
     config_class = MiniMindConfig
     _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
@@ -512,20 +560,7 @@ class MiniMindForCausalLM(PreTrainedModel, GenerationMixin):
             outputs = self.forward(input_ids[:, past_len:], attention_mask, past_key_values, use_cache=use_cache, **kwargs)
             attention_mask = torch.cat([attention_mask, attention_mask.new_ones(attention_mask.shape[0], 1)], -1) if attention_mask is not None else None
             logits = outputs.logits[:, -1, :] / temperature
-            if repetition_penalty != 1.0:
-                for i in range(input_ids.shape[0]):
-                    seen = torch.unique(input_ids[i]); 
-                    score = logits[i, seen]; 
-                    logits[i, seen] = torch.where(score > 0, score / repetition_penalty, score * repetition_penalty)
-            if top_k > 0: 
-                logits[logits < torch.topk(logits, top_k)[0][..., -1, None]] = -float('inf')
-            if top_p < 1.0:
-                sorted_logits, sorted_indices = torch.sort(logits, descending=True)
-                mask = torch.cumsum(torch.softmax(sorted_logits, dim=-1), dim=-1) > top_p
-                mask[..., 1:], mask[..., 0] = mask[..., :-1].clone(), 0
-                logits[mask.scatter(1, sorted_indices, mask)] = -float('inf')
-
-            next_token = torch.multinomial(torch.softmax(logits, dim=-1), num_samples=1) if do_sample else torch.argmax(logits, dim=-1, keepdim=True)
+            next_token = sample_next_token(logits, input_ids, do_sample, top_k, top_p, repetition_penalty)
             if eos_token_id is not None: 
                 next_token = torch.where(
                     finished.unsqueeze(-1), 
