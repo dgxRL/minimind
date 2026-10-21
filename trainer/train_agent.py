@@ -351,7 +351,7 @@ def rl_train_epoch(epoch, loader, iters, rollout_engine, ref_model, reward_model
 
         if (step % args.save_interval == 0 or step == iters) and is_main_process():
             model.eval()
-            moe_suffix = '_moe' if lm_config.use_moe else ''
+            moe_suffix = ('_moe' if lm_config.use_moe else '') + ('_kda' if lm_config.use_kda else '')
             ckp = f'{args.save_dir}/{args.save_weight}_{lm_config.hidden_size}{moe_suffix}.pth'
             raw_model = model.module if isinstance(model, DistributedDataParallel) else model
             raw_model = getattr(raw_model, '_orig_mod', raw_model)
@@ -389,6 +389,7 @@ if __name__ == "__main__":
     parser.add_argument('--hidden_size', default=768, type=int, help="模型隐藏层维度")
     parser.add_argument('--num_hidden_layers', default=8, type=int, help="模型层数")
     parser.add_argument('--use_moe', default=0, type=int, choices=[0, 1], help="是否使用MoE")
+    parser.add_argument('--use_kda', default=0, type=int, choices=[0, 1], help="是否使用KDA线性注意力混合架构（0=否，1=是）")
     parser.add_argument('--max_seq_len', default=1024, type=int, help="最大序列长度")
     parser.add_argument("--max_gen_len", type=int, default=768, help="单次最大生成长度")
     parser.add_argument("--max_total_len", type=int, default=2500, help="训练侧最终总长度上界")
@@ -419,7 +420,7 @@ if __name__ == "__main__":
 
     os.makedirs(args.save_dir, exist_ok=True)
     lm_config = MiniMindConfig(hidden_size=args.hidden_size, num_hidden_layers=args.num_hidden_layers,
-                               max_seq_len=args.max_seq_len + args.max_gen_len, use_moe=bool(args.use_moe))
+                               max_seq_len=args.max_seq_len + args.max_gen_len, use_moe=bool(args.use_moe), use_kda=bool(args.use_kda))
     ckp_data = lm_checkpoint(lm_config, weight=args.save_weight, save_dir='../checkpoints') if args.from_resume == 1 else None
 
     device_type = "cuda" if "cuda" in args.device else "cpu"
