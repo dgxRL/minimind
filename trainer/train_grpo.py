@@ -179,7 +179,7 @@ def grpo_train_epoch(epoch, loader, iters, rollout_engine, ref_model, reward_mod
 
         if (step % args.save_interval == 0 or step == iters) and is_main_process():
             model.eval()
-            moe_suffix = '_moe' if lm_config.use_moe else ''
+            moe_suffix = ('_moe' if lm_config.use_moe else '') + ('_kda' if lm_config.use_kda else '') + ('_attnres' if lm_config.use_attnres else '')
             ckp = f'{args.save_dir}/{args.save_weight}_{lm_config.hidden_size}{moe_suffix}.pth'
             raw_model = model.module if isinstance(model, DistributedDataParallel) else model
             raw_model = getattr(raw_model, '_orig_mod', raw_model)
@@ -220,6 +220,8 @@ if __name__ == "__main__":
     parser.add_argument('--hidden_size', default=768, type=int, help="隐藏层维度")
     parser.add_argument('--num_hidden_layers', default=8, type=int, help="隐藏层数量")
     parser.add_argument('--use_moe', default=0, type=int, choices=[0, 1], help="是否使用MoE架构（0=否，1=是）")
+    parser.add_argument('--use_kda', default=0, type=int, choices=[0, 1], help="是否使用KDA线性注意力混合架构（0=否，1=是）")
+    parser.add_argument('--use_attnres', default=0, type=int, choices=[0, 1], help="是否使用注意力残差Block AttnRes（0=否，1=是）")
     parser.add_argument('--max_seq_len', default=768, type=int, help="Prompt最大长度")
     parser.add_argument("--max_gen_len", type=int, default=1024, help="生成的最大长度")
     parser.add_argument("--data_path", type=str, default="../dataset/rlaif.jsonl", help="RLAIF数据路径")
@@ -251,7 +253,7 @@ if __name__ == "__main__":
     # ========== 2. 配置目录、模型参数、检查ckp ==========
     os.makedirs(args.save_dir, exist_ok=True)
     lm_config = MiniMindConfig(hidden_size=args.hidden_size, num_hidden_layers=args.num_hidden_layers,
-                               max_seq_len=args.max_seq_len + args.max_gen_len, use_moe=bool(args.use_moe))
+                               max_seq_len=args.max_seq_len + args.max_gen_len, use_moe=bool(args.use_moe), use_kda=bool(args.use_kda), use_attnres=bool(args.use_attnres))
     ckp_data = lm_checkpoint(lm_config, weight=args.save_weight, save_dir='../checkpoints') if args.from_resume==1 else None
     
     # ========== 3. 设置混合精度 ==========

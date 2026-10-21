@@ -32,3 +32,4 @@ modelscope==1.37.0
 # torchvision==0.21.0
 # peft==0.7.1
 # matplotlib==3.10.0
+# flash-linear-attention==0.5.2  # 可选：KDA(use_kda)的Triton内核，未安装时回退到纯PyTorch实现（慢）

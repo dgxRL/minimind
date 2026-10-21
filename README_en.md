@@ -287,7 +287,7 @@ If you need to install or switch PyTorch versions, refer to [torch_stable](https
 
 ### 1' Download Data
 
-Download the required data files from the [dataset download link](https://www.modelscope.cn/datasets/gongjy/minimind_dataset/files) provided below, and place them in the `./dataset` directory
+Download the required data files from the [dataset download link](https://huggingface.co/datasets/jingyaogong/minimind_dataset/tree/main) provided below, and place them in the `./dataset` directory
 
 > Currently, by default, you only need to download `pretrain_t2t_mini.jsonl` and `sft_t2t_mini.jsonl` to quickly reproduce the `MiniMind Zero` dialogue model.
 For other use cases, several data combinations are provided below and can be selected according to your task objectives and GPU resources.
@@ -483,7 +483,7 @@ Besides this, other RL data maintains the same format as SFT data, typically fil
 > [!NOTE]
 > The core datasets needed for the current main branch training have been open-sourced, so you do not need to preprocess large-scale datasets yourself.
 
-MiniMind training dataset download links: [ModelScope](https://www.modelscope.cn/datasets/gongjy/minimind_dataset/files) | [HuggingFace](https://huggingface.co/datasets/jingyaogong/minimind_dataset/tree/main)
+MiniMind training dataset download link: [HuggingFace](https://huggingface.co/datasets/jingyaogong/minimind_dataset/tree/main)
 
 > No need to clone everything, you can download individual files as needed
 

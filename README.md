@@ -288,7 +288,7 @@ print(torch.cuda.is_available())
 
 ### 1' 下载数据
 
-从下文提供的[数据集下载链接](https://www.modelscope.cn/datasets/gongjy/minimind_dataset/files) 下载所需数据文件，并放入 `./dataset` 目录
+从下文提供的[数据集下载链接](https://huggingface.co/datasets/jingyaogong/minimind_dataset/tree/main) 下载所需数据文件，并放入 `./dataset` 目录
 
 > 当前默认仅需下载 `pretrain_t2t_mini.jsonl` 与 `sft_t2t_mini.jsonl`，即可较快复现 `MiniMind Zero` 对话模型。
 如有更多需求，下文提供多种搭配方案，可根据自身任务目标与 GPU 资源灵活选择。
@@ -484,7 +484,7 @@ torchrun --nproc_per_node N train_xxx.py
 > [!NOTE]
 > 当前主线训练所需的核心数据集已开源，因此无需再自行预处理大规模数据集，避免重复性的数据处理工作。
 
-MiniMind训练数据集下载地址： [ModelScope](https://www.modelscope.cn/datasets/gongjy/minimind_dataset/files) | [HuggingFace](https://huggingface.co/datasets/jingyaogong/minimind_dataset/tree/main)
+MiniMind训练数据集下载地址： [HuggingFace](https://huggingface.co/datasets/jingyaogong/minimind_dataset/tree/main)
 
 > 无需全部clone，可单独下载所需的文件
 
