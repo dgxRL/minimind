@@ -38,6 +38,7 @@ def convert_torch2transformers_minimind(torch_path, transformers_path, dtype=tor
 
 # QwenForCausalLM/LlamaForCausalLM结构兼容生态
 def convert_torch2transformers(torch_path, transformers_path, dtype=torch.float16):
+    assert not lm_config.use_kda, "Qwen3格式不支持KDA层，请使用convert_torch2transformers_minimind"
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     state_dict = torch.load(torch_path, map_location=device)
     common_config = {
