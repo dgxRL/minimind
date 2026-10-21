@@ -123,7 +123,7 @@ def train_epoch(epoch, loader, iters, teacher_model, lm_config_student, start_st
 
         if (step % args.save_interval == 0 or step == iters) and is_main_process():
             model.eval()
-            moe_suffix = ('_moe' if lm_config_student.use_moe else '') + ('_kda' if lm_config_student.use_kda else '')
+            moe_suffix = ('_moe' if lm_config_student.use_moe else '') + ('_kda' if lm_config_student.use_kda else '') + ('_attnres' if lm_config_student.use_attnres else '')
             ckp = f'{args.save_dir}/{args.save_weight}_{lm_config_student.hidden_size}{moe_suffix}.pth'
             raw_model = model.module if isinstance(model, DistributedDataParallel) else model
             raw_model = getattr(raw_model, '_orig_mod', raw_model)
@@ -166,8 +166,10 @@ if __name__ == "__main__":
     parser.add_argument('--teacher_num_layers', default=8, type=int, help="教师模型隐藏层数量")
     parser.add_argument('--student_use_moe', default=0, type=int, choices=[0, 1], help="学生模型是否使用MoE（0=否，1=是）")
     parser.add_argument('--student_use_kda', default=0, type=int, choices=[0, 1], help="学生模型是否使用KDA（0=否，1=是）")
+    parser.add_argument('--student_use_attnres', default=0, type=int, choices=[0, 1], help="学生模型是否使用AttnRes（0=否，1=是）")
     parser.add_argument('--teacher_use_moe', default=1, type=int, choices=[0, 1], help="教师模型是否使用MoE（0=否，1=是）")
     parser.add_argument('--teacher_use_kda', default=0, type=int, choices=[0, 1], help="教师模型是否使用KDA（0=否，1=是）")
+    parser.add_argument('--teacher_use_attnres', default=0, type=int, choices=[0, 1], help="教师模型是否使用AttnRes（0=否，1=是）")
     parser.add_argument('--from_student_weight', default='full_sft', type=str, help="学生模型基于哪个权重")
     parser.add_argument('--from_teacher_weight', default='full_sft', type=str, help="教师模型基于哪个权重")
     parser.add_argument('--from_resume', default=0, type=int, choices=[0, 1], help="是否自动检测&续训（0=否，1=是）")
@@ -185,8 +187,8 @@ if __name__ == "__main__":
     
     # ========== 2. 配置目录、模型参数、检查ckp ==========
     os.makedirs(args.save_dir, exist_ok=True)
-    lm_config_student = MiniMindConfig(hidden_size=args.student_hidden_size, num_hidden_layers=args.student_num_layers, use_moe=bool(args.student_use_moe), use_kda=bool(args.student_use_kda))
-    lm_config_teacher = MiniMindConfig(hidden_size=args.teacher_hidden_size, num_hidden_layers=args.teacher_num_layers, use_moe=bool(args.teacher_use_moe), use_kda=bool(args.teacher_use_kda))
+    lm_config_student = MiniMindConfig(hidden_size=args.student_hidden_size, num_hidden_layers=args.student_num_layers, use_moe=bool(args.student_use_moe), use_kda=bool(args.student_use_kda), use_attnres=bool(args.student_use_attnres))
+    lm_config_teacher = MiniMindConfig(hidden_size=args.teacher_hidden_size, num_hidden_layers=args.teacher_num_layers, use_moe=bool(args.teacher_use_moe), use_kda=bool(args.teacher_use_kda), use_attnres=bool(args.teacher_use_attnres))
     ckp_data = lm_checkpoint(lm_config_student, weight=args.save_weight, save_dir='../checkpoints') if args.from_resume==1 else None
     
     # ========== 3. 设置混合精度 ==========

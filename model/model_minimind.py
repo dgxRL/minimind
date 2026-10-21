@@ -355,11 +355,18 @@ class AttnRes(nn.Module):
         self.query = nn.Parameter(torch.zeros(config.hidden_size))
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
+    @staticmethod
+    def source(v, eps):
+        # a depth source is (v, 1/rms(v)); the scale is shared by every later layer, so completed blocks compute it once
+        return v, torch.rsqrt(torch.linalg.vector_norm(v, dim=-1, dtype=torch.float32).pow(2) / v.shape[-1] + eps)
+
     def forward(self, sources):
+        # w^T (g * v / rms(v)) == ((w * g)^T v) / rms(v): fold the RMSNorm weight into the query, no normalized copies
         # always computed, even for a single source, so every parameter gets a gradient (DDP)
-        v = torch.stack(sources)  # [N, B, T, D]
-        logits = (self.norm(v).float() * self.query.float()).sum(-1)  # fp32 elementwise to stay outside autocast
-        return (logits.softmax(0).unsqueeze(-1) * v.float()).sum(0).type_as(v)
+        q = self.query * self.norm.weight
+        logits = torch.stack([(v @ q.to(v.dtype)).float() * r for v, r in sources])  # [N, B, T]
+        alpha = logits.softmax(0)
+        return sum(a.to(v.dtype).unsqueeze(-1) * v for a, (v, _) in zip(alpha, sources))
 
 class MiniMindBlock(nn.Module):
     def __init__(self, layer_id: int, config: MiniMindConfig):
@@ -389,7 +396,7 @@ class MiniMindBlock(nn.Module):
         return hidden_states, present_key_value
 
     def forward_attn_res(self, attn_res_state, position_embeddings, past_key_value=None, use_cache=False, attention_mask=None):
-        # blocks: completed block representations [b_0 = embedding, b_1, ...]; partial: running sum of the current block (None at its start)
+        # blocks: completed block sources [b_0 = embedding, b_1, ...] as (v, 1/rms); partial: running sum of the current block (None at its start)
         blocks, partial = attn_res_state
         sublayers = [
             (self.attn_res, lambda h: self.self_attn(self.input_layernorm(h), position_embeddings, past_key_value, use_cache, attention_mask)),
@@ -397,10 +404,10 @@ class MiniMindBlock(nn.Module):
         ]
         present_key_value = None
         for (res, fn), close in zip(sublayers, self.attn_res_close):
-            out, present = fn(res(blocks if partial is None else blocks + [partial]))
+            out, present = fn(res(blocks if partial is None else blocks + [AttnRes.source(partial, res.norm.eps)]))
             present_key_value = present if present is not None else present_key_value
             partial = out if partial is None else partial + out
-            if close: blocks, partial = blocks + [partial], None
+            if close: blocks, partial = blocks + [AttnRes.source(partial, res.norm.eps)], None
         return (blocks, partial), present_key_value
 
 class MiniMindModel(nn.Module):
@@ -442,7 +449,7 @@ class MiniMindModel(nn.Module):
         position_embeddings = (self.freqs_cos[start_pos:start_pos + seq_length], self.freqs_sin[start_pos:start_pos + seq_length])
 
         presents = []
-        attn_res_state = ([hidden_states], None) if self.config.use_attnres else None
+        attn_res_state = ([AttnRes.source(hidden_states, self.config.rms_norm_eps)], None) if self.config.use_attnres else None
         for layer, past_key_value in zip(self.layers, past_key_values):
             out, present = layer(
                 hidden_states,
@@ -458,7 +465,7 @@ class MiniMindModel(nn.Module):
         if attn_res_state is not None:
             # the output layer aggregates the embedding and all block representations
             blocks, partial = attn_res_state
-            hidden_states = self.final_attn_res(blocks if partial is None else blocks + [partial])
+            hidden_states = self.final_attn_res(blocks if partial is None else blocks + [AttnRes.source(partial, self.config.rms_norm_eps)])
         hidden_states = self.norm(hidden_states)
         aux_loss = sum([l.mlp.aux_loss for l in self.layers if isinstance(l.mlp, MOEFeedForward)], hidden_states.new_zeros(1).squeeze())
         return hidden_states, presents, aux_loss
